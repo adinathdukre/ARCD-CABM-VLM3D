@@ -1,0 +1,73 @@
+# @package _global_
+model:
+  _target_: model_arch.anymc3d.AnyMC3DLightningModule
+  task: multilabel
+  num_classes: 18
+  modalities: [ct]
+  backbone_name: dinov2_vitb14
+  lora_rank: 8
+  lora_alpha: 16
+  input_size: 224
+  cls_head_dropout: 0.1
+  slice_axis: 3
+  vision_blocks: 0
+  mlp_ratio: 4.0
+  block_dropout: 0.0
+  use_slice_attn_pool: true
+  use_patch_concat: false
+  use_25d: false
+  use_patch_attn_pool: false
+  use_disease_queries: true
+  use_cross_disease_relation: false
+
+  # ARCD: paired-reconstruction noise filtering and routed distillation.
+  multilabel_loss: acer_crs
+  asl_gamma_pos: 0.0
+  asl_gamma_neg: 4.0
+  asl_clip: 0.05
+  crs_threshold: 0.90
+  crs_temperature: 0.05
+  crs_minimum_weight: 0.25
+  consistency_weight: 0.0
+  consistency_temperature: 1.0
+  acquisition_metadata_dim: 13
+  acquisition_gate_hidden_dim: 64
+  acquisition_evidence_scale: 1.0
+  acquisition_metadata_dropout: 0.20
+  acquisition_gate_entropy_weight: 0.0
+  acquisition_distillation_weight: 0.20
+  acquisition_distillation_temperature: 1.5
+  acquisition_routing_weight: 0.05
+  acquisition_routing_minimum_margin: 0.25
+
+  # TAM: tail-aware positive margins plus deferred effective-number weighting.
+  # Counts follow data.module.label_cols order in the 47,149-volume train CSV.
+  tail_positive_counts:
+    [5818, 13377, 5308, 3412, 12025, 6751, 12221, 9122, 12263,
+     21382, 17420, 12589, 5705, 3638, 4973, 8319, 4732, 3745]
+  tail_margin_max: 0.35
+  tail_effective_beta: 0.9999
+  tail_drw_start_fraction: 0.5
+
+  lora_lr: 5.0e-6
+  lora_weight_decay: 1.0e-5
+  vision_lr: 5.0e-6
+  vision_weight_decay: 1.0e-5
+  head_lr: 5.0e-5
+  head_weight_decay: 1.0e-4
+  warmup_epochs: 0
+  lr_scheduler: constant
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+  max_epochs: 2
+  seed: 2041
+  precision: "bf16-mixed"
+  early_stopping_patience: 2
+  save_top_k: 1
+  log_every_n_steps: 20
+  devices: 1
+  strategy: ddp
+  num_nodes: 8
+  sync_batchnorm: false
+  project: "ct-rate-anymc3d"
+  run_name: "ct_rate_arcd_tam_dinov2_vitb_96s_v1"
