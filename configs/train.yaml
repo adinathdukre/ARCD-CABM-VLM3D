@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------
+# Main training config
+# ---------------------------------------------------------------
+# The model file now bundles its matching optimizer and loss via
+# `# @package _global_`, so those groups have dropped out of the
+# defaults list. Picking `model=anymc3d` is enough to get all three.
+#
+# Override any group from the command line:
+#   python train.py                             # uses defaults below
+#   python train.py data=pdcad model=anymc3d    # explicit (same thing)
+#   python train.py model=vjepa2_anymc3d        # swap model (+ its optimizer+loss)
+#   python train.py optimizer.lora_lr=2e-4      # override individual keys still works
+#   python train.py loss.focal_alpha=0.25       # ditto
+
+defaults:
+  - _self_
+  - data:     pdcad
+  - model:    anymc3d_vitb
+
+# Optional Lightning checkpoint used to restore model, optimizer, scheduler,
+# callback, epoch, and global-step state. Leave null for a fresh run.
+resume_from_checkpoint: null
+
+# Optional trusted checkpoint used only to initialize model weights. Unlike a
+# resume, this deliberately starts a new optimizer, scheduler, and epoch count.
+init_from_checkpoint: null
+
+# Root directory for run checkpoints. This can be redirected to scratch on
+# clusters where the home filesystem has a small quota.
+checkpoint_root: checkpoints
+
+# Optional mid-epoch recovery checkpoint interval. This is useful for runs
+# that need more than one Slurm wall-time allocation to finish an epoch.
+checkpoint_every_n_train_steps: null
