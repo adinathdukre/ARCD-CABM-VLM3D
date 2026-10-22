@@ -116,5 +116,3 @@ Evaluation metrics: macro AUROC, AUPRC, F1, Brier score, ECE and CRG.
 ## Usage terms
 
 Models are trained on CT-RATE, which is released under CC BY-NC-SA. Code and weights in this repository are for non-commercial research use under the same terms. DINOv2 weights remain under their original license.
-# ARCD-CABM-VLM3D
-Team genmi (MBZUAI), VLM3D 2026 CT abnormality classification: ARCD-CABM code, configs and weights (placeholder, content coming soon)
