@@ -1,0 +1,44 @@
+name: CT-RATE-ACER
+dataset: ct-rate
+augment: true
+
+module:
+  _target_: data_modules.ct_rate_dataset.CTRateDataModule
+  fold: 0
+  train_root: <CT_RATE_ROOT>/train_fixed
+  val_root: <CT_RATE_ROOT>/valid_fixed
+  train_labels_path: <CT_RATE_ROOT>/multi_abnormality_labels/train_predicted_labels.csv
+  val_labels_path: <CT_RATE_ROOT>/multi_abnormality_labels/valid_predicted_labels.csv
+  train_exclusion_path: <CT_RATE_ROOT>/metadata/no_chest_train.txt
+  val_exclusion_path: <CT_RATE_ROOT>/metadata/no_chest_valid.txt
+  train_metadata_path: <CT_RATE_ROOT>/metadata/train_metadata.csv
+  val_metadata_path: <CT_RATE_ROOT>/metadata/validation_metadata.csv
+  num_slices: 96
+  image_size: 224
+  batch_size: 1
+  num_workers: 2
+  train_limit: null
+  val_limit: null
+  task: multilabel
+  family_balanced: true
+  pair_reconstructions: true
+
+  label_cols:
+    - "Medical material"
+    - "Arterial wall calcification"
+    - "Cardiomegaly"
+    - "Pericardial effusion"
+    - "Coronary artery wall calcification"
+    - "Hiatal hernia"
+    - "Lymphadenopathy"
+    - "Emphysema"
+    - "Atelectasis"
+    - "Lung nodule"
+    - "Lung opacity"
+    - "Pulmonary fibrotic sequela"
+    - "Pleural effusion"
+    - "Mosaic attenuation pattern"
+    - "Peribronchial thickening"
+    - "Consolidation"
+    - "Bronchiectasis"
+    - "Interlobular septal thickening"
