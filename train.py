@@ -1,0 +1,277 @@
+"""
+AnyMC3D Training Script — Hydra config driven
+
+Augmentation is decoupled from data loading:
+    get_datamodule(cfg, fold)  -> instantiates the data module via Hydra
+    attach_augmentation(dm, …) -> transforms attached afterward
+
+Layout:
+    data_modules/pdcad_dataset.py       — PDCADDataModule
+    data_modules/data_augmentation.py   — apply_augmentation, TransformedDataset
+    model/anymc3d.py                    — AnyMC3DLightningModule
+
+Usage:
+    export CUDA_VISIBLE_DEVICES=3
+    python train.py                                  # defaults (data=pdcad, model=anymc3d)
+    python train.py data=pdcad model=anymc3d         # explicit
+    python train.py data=meningioma_t1c              # swap data
+    python train.py data.module.batch_size=4         # override a module kwarg
+    python train.py 'data.module.fold=[0,1,2]'       # multi-fold
+"""
+
+import hydra
+from hydra.utils import instantiate
+from omegaconf import DictConfig, OmegaConf, ListConfig
+import torch
+import lightning as L
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from lightning.pytorch.loggers import WandbLogger
+import wandb
+from pathlib import Path
+
+
+def get_datamodule(cfg, fold: int):
+    """
+    Build the raw data module — no augmentation attached here.
+
+    For pdcad, the data module is instantiated directly from the config via
+    hydra.utils.instantiate, using cfg.data.module (which carries _target_
+    plus the constructor kwargs). The `fold` kwarg is passed as an explicit
+    override so multi-fold loops pick up the current iteration's fold.
+    """
+    return instantiate(cfg.data.module, fold=fold)
+
+
+def attach_augmentation(dm, cfg):
+    """
+    Attach train/eval transforms to the data module *after* construction.
+
+    Reads cfg.data.augment (the flag, at the data-group level) — NOT
+    cfg.data.module.augment, because `augment` isn't a PDCADDataModule
+    constructor argument.
+    """
+    from data_modules.data_augmentation import apply_augmentation
+    apply_augmentation(dm, augment_train=cfg.data.augment)
+    return dm
+
+
+def get_model(cfg):
+    return instantiate(cfg.model)
+
+
+def train_one_fold(cfg, fold: int, multi_fold: bool = False):
+    base_name = cfg.model.run_name
+    checkpoint_root = Path(str(cfg.get("checkpoint_root", "checkpoints"))).expanduser()
+    if multi_fold:
+        run_name = base_name
+        ckpt_dir = checkpoint_root / base_name / str(fold)
+    else:
+        run_name = f"{base_name}_fold{fold}"
+        ckpt_dir = checkpoint_root / run_name
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    wandb_run_name = f"{base_name}_fold{fold}"
+
+    print(f"\n{'='*60}")
+    print(f"  Fold {fold} — {wandb_run_name}")
+    print(f"  Checkpoint dir: {ckpt_dir}")
+    print(f"{'='*60}")
+
+    OmegaConf.save(cfg, ckpt_dir / "config.yaml")
+    print(f"Config saved -> {ckpt_dir / 'config.yaml'}\n")
+
+    dm = get_datamodule(cfg, fold)
+
+    attach_augmentation(dm, cfg)
+
+    model = get_model(cfg)
+
+    resume_checkpoint = cfg.get("resume_from_checkpoint")
+    init_checkpoint = cfg.get("init_from_checkpoint")
+    if resume_checkpoint and init_checkpoint:
+        raise ValueError(
+            "Set only one of resume_from_checkpoint or init_from_checkpoint"
+        )
+
+    if init_checkpoint:
+        init_checkpoint = str(Path(init_checkpoint).expanduser().resolve())
+        if not Path(init_checkpoint).is_file():
+            raise FileNotFoundError(
+                f"Initialization checkpoint not found: {init_checkpoint}"
+            )
+        # This path is explicitly supplied for our locally produced, trusted
+        # Lightning checkpoint. Full checkpoints contain OmegaConf objects and
+        # therefore cannot use PyTorch 2.6's restricted weights-only loader.
+        checkpoint = torch.load(
+            init_checkpoint, map_location="cpu", weights_only=False
+        )
+        incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
+        unexpected = list(incompatible.unexpected_keys)
+        missing = list(incompatible.missing_keys)
+        allowed_missing_prefixes = (
+            "model.relation_adapter.",
+            "acquisition_gate.",
+            "tail_positive_",
+        )
+        allowed_missing = all(
+            key.startswith(allowed_missing_prefixes) for key in missing
+        )
+        if unexpected or not allowed_missing:
+            raise RuntimeError(
+                "Incompatible initialization checkpoint: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        print(
+            f"Warm-started model from {init_checkpoint}; "
+            f"new parameters={missing}"
+        )
+
+    wandb_logger = WandbLogger(
+        project = cfg.model.project,
+        name    = wandb_run_name,
+        config  = OmegaConf.to_container(cfg, resolve=True),
+    )
+
+    checkpoint_cb = ModelCheckpoint(
+        dirpath    = str(ckpt_dir),
+        monitor    = "val/AUROC",
+        mode       = "max",
+        save_top_k = cfg.model.save_top_k,
+        save_last  = True,
+        filename   = "epoch={epoch:02d}-val_auroc={val/AUROC:.4f}",
+        auto_insert_metric_name = False,
+        verbose    = True,
+    )
+    early_stop_cb = EarlyStopping(
+        monitor  = "val/loss",
+        mode     = "min",
+        patience = cfg.model.early_stopping_patience,
+        verbose  = True,
+    )
+    lr_monitor = LearningRateMonitor()
+
+    callbacks = [checkpoint_cb, early_stop_cb, lr_monitor]
+    checkpoint_every_n_train_steps = int(
+        cfg.get("checkpoint_every_n_train_steps") or 0
+    )
+    if checkpoint_every_n_train_steps > 0:
+        # Keep a separate, rolling recovery checkpoint. The primary callback
+        # above remains responsible for best/last epoch checkpoints.
+        recovery_checkpoint_cb = ModelCheckpoint(
+            dirpath=str(ckpt_dir / "resume"),
+            monitor=None,
+            save_top_k=0,
+            save_last=True,
+            filename="step={step}",
+            auto_insert_metric_name=False,
+            every_n_train_steps=checkpoint_every_n_train_steps,
+            every_n_epochs=0,
+            save_on_train_epoch_end=False,
+            verbose=True,
+        )
+        callbacks.append(recovery_checkpoint_cb)
+        print(
+            "Rolling recovery checkpoint enabled every "
+            f"{checkpoint_every_n_train_steps} training steps."
+        )
+
+    # Lightning's Rich progress callback is active only on rank zero. Reading
+    # epoch metrics from that callback can start a lazy sync_dist collective
+    # while the remaining ranks are already inside TorchMetrics.compute(),
+    # producing a collective-order mismatch. Disable it whenever world_size>1.
+    world_size = int(cfg.model.devices) * int(cfg.model.num_nodes)
+
+    trainer = L.Trainer(
+        max_epochs        = cfg.model.max_epochs,
+        accelerator       = "gpu",
+        devices           = cfg.model.devices,
+        strategy          = cfg.model.strategy,
+        num_nodes         = cfg.model.num_nodes,
+        sync_batchnorm    = cfg.model.sync_batchnorm,
+        precision         = cfg.model.precision,
+        logger            = wandb_logger,
+        callbacks         = callbacks,
+        log_every_n_steps = cfg.model.log_every_n_steps,
+        enable_progress_bar = world_size == 1,
+        num_sanity_val_steps = 2 if world_size == 1 else 0,
+        deterministic     = False,
+    )
+
+    if resume_checkpoint:
+        resume_checkpoint = str(Path(resume_checkpoint).expanduser().resolve())
+        if not Path(resume_checkpoint).is_file():
+            raise FileNotFoundError(
+                f"Resume checkpoint not found: {resume_checkpoint}"
+            )
+        print(f"Resuming training — fold {fold} from {resume_checkpoint}...")
+    else:
+        print(f"Starting training — fold {fold}...")
+    trainer.fit(
+        model,
+        datamodule=dm,
+        ckpt_path=resume_checkpoint,
+        # Resume checkpoints are generated locally by this training code and
+        # include optimizer/callback state beyond plain tensor weights.
+        weights_only=False if resume_checkpoint else None,
+    )
+
+    print(f"\nRunning test set evaluation — fold {fold}...")
+    if "test" in dm._available_splits:
+        trainer.test(model, datamodule=dm, ckpt_path="best")
+    else:
+        print(f"No test split — skipping test evaluation for fold {fold}.")
+
+    wandb.finish()
+    print(f"\nFold {fold} complete. Outputs: {ckpt_dir}")
+
+
+@hydra.main(version_base=None, config_path="configs", config_name="train")
+def main(cfg: DictConfig) -> None:
+
+    torch.set_float32_matmul_precision('medium')
+    L.seed_everything(cfg.model.seed)
+
+    # ── Sanity check: model task and data task must agree ─────────────────
+    model_task = cfg.model.get('task', 'multiclass')
+    data_task  = cfg.data.module.get('task', 'multiclass')
+    if model_task != data_task:
+        raise ValueError(
+            f"Task mismatch: model.task={model_task!r} but "
+            f"data.module.task={data_task!r}. They must agree."
+        )
+
+    # Also: for multilabel, num_classes must equal len(label_cols)
+    if model_task == 'multilabel':
+        n_labels = len(cfg.data.module.get('label_cols') or [])
+        if cfg.model.num_classes != n_labels:
+            raise ValueError(
+                f"Multilabel: model.num_classes={cfg.model.num_classes} "
+                f"but data has {n_labels} label_cols. They must match."
+            )
+
+    print("\n" + "=" * 60)
+    print(f"Training: {cfg.model.run_name}")
+    print("=" * 60)
+    print(OmegaConf.to_yaml(cfg))
+    print("=" * 60 + "\n")
+
+    fold_cfg = cfg.data.module.fold
+
+    if isinstance(fold_cfg, (list, ListConfig)):
+        folds = list(fold_cfg)
+        print(f"Multi-fold training: folds {folds}\n")
+    else:
+        folds = [int(fold_cfg)]
+        print(f"Single-fold training: fold {folds[0]}\n")
+
+    multi_fold = len(folds) > 1
+    for fold in folds:
+        train_one_fold(cfg, fold, multi_fold=multi_fold)
+
+    print(f"\n{'='*60}")
+    print(f"All folds complete: {folds}")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()
